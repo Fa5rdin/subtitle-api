@@ -6,74 +6,107 @@ from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("PORT", 8080))
 
-class SubtitleHandler(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
-        if parsed.path == "/subtitles":
-            url = params.get("url", [None])[0]
-            if not url:
-                self.respond(400, {"error": "Missing url parameter"})
+        if parsed.path == "/health":
+            self.send_json(200, {"status": "ok"})
+            return
+
+        if parsed.path != "/subtitles":
+            self.send_json(404, {"error": "Not found"})
+            return
+
+        url = params.get("url", [None])[0]
+        if not url:
+            self.send_json(400, {"error": "Missing url parameter"})
+            return
+
+        print(f"Fetching subtitles for: {url}")
+
+        try:
+            cmd = [
+                "yt-dlp",
+                "--no-warnings",
+                "--skip-download",
+                "--write-auto-sub",
+                "--write-sub",
+                "--dump-json",
+                url
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            print(f"Return code: {result.returncode}")
+            print(f"Stderr: {result.stderr[:500]}")
+            
+            if result.returncode != 0:
+                self.send_json(500, {
+                    "error": "yt-dlp failed",
+                    "details": result.stderr[:300]
+                })
                 return
 
-            try:
-                result2 = subprocess.run(
-                    ["yt-dlp", "-j", "--skip-download", url],
-                    capture_output=True, text=True, timeout=30
-                )
+            if not result.stdout.strip():
+                self.send_json(500, {"error": "No output from yt-dlp"})
+                return
 
-                if result2.returncode != 0:
-                    self.respond(500, {"error": "Failed to fetch video info", "details": result2.stderr})
-                    return
-
-                info = json.loads(result2.stdout)
-                subtitles = info.get("subtitles", {})
-                auto_captions = info.get("automatic_captions", {})
-
-                tracks = []
-                for lang, formats in subtitles.items():
-                    for fmt in formats:
+            info = json.loads(result.stdout.strip().split('\n')[0])
+            
+            subtitles = info.get("subtitles", {})
+            auto_captions = info.get("automatic_captions", {})
+            
+            tracks = []
+            
+            # Manual subtitles
+            for lang, formats in subtitles.items():
+                for fmt in formats:
+                    if fmt.get("ext") in ["vtt", "srt"]:
                         tracks.append({
                             "lang": lang,
-                            "ext": fmt.get("ext", "vtt"),
+                            "ext": fmt.get("ext"),
                             "url": fmt.get("url", ""),
-                            "name": fmt.get("name", lang),
+                            "name": info.get("subtitles_name", {}).get(lang, lang),
                             "type": "manual"
                         })
+                        break
 
-                for lang, formats in auto_captions.items():
-                    for fmt in formats:
-                        if fmt.get("ext") in ["vtt", "srv1", "srv2", "srv3", "json3"]:
-                            tracks.append({
-                                "lang": lang,
-                                "ext": fmt.get("ext", "vtt"),
-                                "url": fmt.get("url", ""),
-                                "name": fmt.get("name", lang),
-                                "type": "auto"
-                            })
-                            break
+            # Auto-generated captions  
+            for lang, formats in auto_captions.items():
+                for fmt in formats:
+                    if fmt.get("ext") == "vtt":
+                        tracks.append({
+                            "lang": lang,
+                            "ext": "vtt",
+                            "url": fmt.get("url", ""),
+                            "name": lang,
+                            "type": "auto"
+                        })
+                        break
 
-                self.respond(200, {
-                    "title": info.get("title", ""),
-                    "tracks": tracks
-                })
+            print(f"Found {len(tracks)} tracks")
+            
+            self.send_json(200, {
+                "title": info.get("title", ""),
+                "tracks": tracks
+            })
 
-            except subprocess.TimeoutExpired:
-                self.respond(500, {"error": "Request timed out"})
-            except Exception as e:
-                self.respond(500, {"error": str(e)})
-        else:
-            self.respond(404, {"error": "Not found"})
+        except subprocess.TimeoutExpired:
+            self.send_json(500, {"error": "Timeout - video took too long"})
+        except json.JSONDecodeError as e:
+            self.send_json(500, {"error": f"JSON parse error: {str(e)}"})
+        except Exception as e:
+            self.send_json(500, {"error": str(e)})
 
-    def respond(self, code, data):
+    def send_json(self, code, data):
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -86,6 +119,6 @@ class SubtitleHandler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {format % args}")
 
 if __name__ == "__main__":
-    print(f"Server running on port {PORT}")
-    server = HTTPServer(("0.0.0.0", PORT), SubtitleHandler)
+    print(f"Server starting on port {PORT}")
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
