@@ -41,15 +41,20 @@ class Handler(BaseHTTPRequestHandler):
                 subtitles = info.get("subtitles", {})
                 auto_captions = info.get("automatic_captions", {})
                 tracks = []
+                # Only manual subtitles + original language auto-caption
+                original_lang = info.get("language", "en") or "en"
+                
                 for lang, formats in subtitles.items():
                     for fmt in formats:
                         if fmt.get("ext") == "vtt":
-                            tracks.append({"lang": lang, "ext": "vtt", "url": fmt.get("url", ""), "name": lang, "type": "manual"})
+                            tracks.append({"lang": lang, "ext": "vtt", "url": fmt.get("url", ""), "name": fmt.get("name", lang), "type": "manual"})
                             break
-                for lang, formats in auto_captions.items():
-                    for fmt in formats:
+                
+                # Add auto-caption only for the video's original language
+                if original_lang in auto_captions:
+                    for fmt in auto_captions[original_lang]:
                         if fmt.get("ext") == "vtt":
-                            tracks.append({"lang": lang, "ext": "vtt", "url": fmt.get("url", ""), "name": lang, "type": "auto"})
+                            tracks.append({"lang": original_lang, "ext": "vtt", "url": fmt.get("url", ""), "name": fmt.get("name", original_lang) + " (Auto)", "type": "auto"})
                             break
                 self.send_json(200, {"title": info.get("title", ""), "tracks": tracks})
             except Exception as e:
