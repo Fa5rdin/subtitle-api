@@ -1,7 +1,8 @@
 import os
 import json
 import subprocess
-import urllib.request
+import tempfile
+import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -28,8 +29,6 @@ class Handler(BaseHTTPRequestHandler):
             if not url:
                 self.send_json(400, {"error": "Missing url parameter"})
                 return
-
-            print(f"Fetching subtitles for: {url}")
             try:
                 result = subprocess.run(
                     ["yt-dlp", "--no-warnings", "--skip-download", "--dump-json", url],
@@ -38,65 +37,72 @@ class Handler(BaseHTTPRequestHandler):
                 if result.returncode != 0:
                     self.send_json(500, {"error": "yt-dlp failed", "details": result.stderr[:300]})
                     return
-
                 info = json.loads(result.stdout.strip().split('\n')[0])
                 subtitles = info.get("subtitles", {})
                 auto_captions = info.get("automatic_captions", {})
                 tracks = []
-
                 for lang, formats in subtitles.items():
                     for fmt in formats:
                         if fmt.get("ext") == "vtt":
                             tracks.append({"lang": lang, "ext": "vtt", "url": fmt.get("url", ""), "name": lang, "type": "manual"})
                             break
-
                 for lang, formats in auto_captions.items():
                     for fmt in formats:
                         if fmt.get("ext") == "vtt":
                             tracks.append({"lang": lang, "ext": "vtt", "url": fmt.get("url", ""), "name": lang, "type": "auto"})
                             break
-
                 self.send_json(200, {"title": info.get("title", ""), "tracks": tracks})
-
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
             return
 
-        if parsed.path == "/proxy":
-            sub_url = params.get("url", [None])[0]
+        if parsed.path == "/download":
+            video_url = params.get("url", [None])[0]
+            lang = params.get("lang", ["en"])[0]
             fmt = params.get("format", ["vtt"])[0]
-            if not sub_url:
+            if not video_url:
                 self.send_json(400, {"error": "Missing url"})
                 return
             try:
-                req = urllib.request.Request(sub_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    content = resp.read().decode("utf-8")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    result = subprocess.run([
+                        "yt-dlp",
+                        "--no-warnings",
+                        "--skip-download",
+                        "--write-auto-sub",
+                        "--write-sub",
+                        "--sub-lang", lang,
+                        "--sub-format", "vtt",
+                        "--convert-subs", "vtt",
+                        "-o", f"{tmpdir}/sub",
+                        video_url
+                    ], capture_output=True, text=True, timeout=60)
 
-                if fmt == "txt":
-                    # Strip VTT formatting to plain text
-                    lines = content.split('\n')
-                    text_lines = []
-                    skip = True
-                    for line in lines:
-                        line = line.strip()
-                        if line == "WEBVTT":
-                            skip = False
-                            continue
-                        if '-->' in line or line == '' or line.startswith('NOTE') or line.isdigit():
-                            continue
-                        if not skip:
+                    files = glob.glob(f"{tmpdir}/*.vtt")
+                    if not files:
+                        self.send_json(404, {"error": "No subtitle file found", "stderr": result.stderr[:200]})
+                        return
+
+                    content = open(files[0], encoding="utf-8").read()
+
+                    if fmt == "txt":
+                        lines = content.split('\n')
+                        text_lines = []
+                        for line in lines:
+                            line = line.strip()
+                            if not line or line == "WEBVTT" or '-->' in line or line.isdigit() or line.startswith('NOTE'):
+                                continue
                             text_lines.append(line)
-                    content = '\n'.join(text_lines)
+                        content = '\n'.join(dict.fromkeys(text_lines))  # dedupe
 
-                body = content.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Disposition", f'attachment; filename="subtitles.{fmt}"')
-                self.send_header("Content-Length", len(body))
-                self.end_headers()
-                self.wfile.write(body)
+                    body = content.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Disposition", f'attachment; filename="subtitles_{lang}.{fmt}"')
+                    self.send_header("Content-Length", len(body))
+                    self.end_headers()
+                    self.wfile.write(body)
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
             return
