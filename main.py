@@ -86,14 +86,36 @@ class Handler(BaseHTTPRequestHandler):
                     content = open(files[0], encoding="utf-8").read()
 
                     if fmt == "txt":
-                        lines = content.split('\n')
-                        text_lines = []
-                        for line in lines:
-                            line = line.strip()
-                            if not line or line == "WEBVTT" or '-->' in line or line.isdigit() or line.startswith('NOTE'):
+                        import re
+                        blocks = content.strip().split('\n\n')
+                        result = []
+                        seen_texts = set()
+                        for block in blocks:
+                            blines = block.strip().split('\n')
+                            timestamp_line = None
+                            text_lines = []
+                            for line in blines:
+                                if '-->' in line:
+                                    timestamp_line = line.split('-->')[0].strip()
+                                elif not line.startswith('WEBVTT') and not line.startswith('Kind:') and not line.startswith('Language:'):
+                                    clean = re.sub(r'<[^>]+>', '', line).strip()
+                                    if clean and clean != ' ':
+                                        text_lines.append(clean)
+                            if not text_lines or not timestamp_line:
                                 continue
-                            text_lines.append(line)
-                        content = '\n'.join(dict.fromkeys(text_lines))  # dedupe
+                            text = text_lines[-1]
+                            if text in seen_texts:
+                                continue
+                            seen_texts.add(text)
+                            try:
+                                parts = timestamp_line.split(':')
+                                h, m, s = int(parts[0]), int(parts[1]), int(float(parts[2]))
+                                total_mins = h * 60 + m
+                                ts = f"[{total_mins:02d}:{s:02d}]"
+                            except:
+                                ts = f"[{timestamp_line}]"
+                            result.append(f"{ts} {text}")
+                        content = '\n'.join(result)
 
                     body = content.encode("utf-8")
                     self.send_response(200)
