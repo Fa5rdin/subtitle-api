@@ -1,124 +1,91 @@
+import os
 import json
 import subprocess
-import tempfile
-import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # silence logs
+PORT = int(os.environ.get("PORT", 8080))
 
+class SubtitleHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
+        if parsed.path == "/subtitles":
+            url = params.get("url", [None])[0]
+            if not url:
+                self.respond(400, {"error": "Missing url parameter"})
+                return
 
-        video_id = params.get('videoId', [None])[0]
-        if not video_id:
-            self.wfile.write(json.dumps({'error': 'Missing videoId'}).encode())
-            return
+            try:
+                result2 = subprocess.run(
+                    ["yt-dlp", "-j", "--skip-download", url],
+                    capture_output=True, text=True, timeout=30
+                )
 
-        url = f'https://www.youtube.com/watch?v={video_id}'
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # Use yt-dlp to list all subtitle info
-                result = subprocess.run([
-                    'yt-dlp',
-                    '--list-subs',
-                    '--no-download',
-                    '--skip-download',
-                    url
-                ], capture_output=True, text=True, timeout=30)
-
-                output = result.stdout + result.stderr
-
-                # Also get JSON info for title and subtitle URLs
-                info_result = subprocess.run([
-                    'yt-dlp',
-                    '--dump-json',
-                    '--skip-download',
-                    url
-                ], capture_output=True, text=True, timeout=30)
-
-                if info_result.returncode != 0:
-                    self.wfile.write(json.dumps({'error': 'Could not fetch video info', 'tracks': []}).encode())
+                if result2.returncode != 0:
+                    self.respond(500, {"error": "Failed to fetch video info", "details": result2.stderr})
                     return
 
-                info = json.loads(info_result.stdout)
-                title = info.get('title', '')
+                info = json.loads(result2.stdout)
+                subtitles = info.get("subtitles", {})
+                auto_captions = info.get("automatic_captions", {})
 
                 tracks = []
-
-                # Get manual subtitles
-                subtitles = info.get('subtitles', {})
-                for lang_code, formats in subtitles.items():
-                    lang_name = lang_code
-                    # Try to get a readable name
+                for lang, formats in subtitles.items():
                     for fmt in formats:
-                        if fmt.get('name'):
-                            lang_name = fmt['name']
-                            break
-                    # Get the srv3/xml url
-                    url_to_use = None
-                    for fmt in formats:
-                        if fmt.get('ext') in ['srv3', 'srv2', 'srv1', 'ttml', 'vtt']:
-                            url_to_use = fmt.get('url')
-                            break
-                    if not url_to_use and formats:
-                        url_to_use = formats[0].get('url')
-
-                    if url_to_use:
                         tracks.append({
-                            'lang': lang_name,
-                            'langCode': lang_code,
-                            'baseUrl': url_to_use,
-                            'isAuto': False
+                            "lang": lang,
+                            "ext": fmt.get("ext", "vtt"),
+                            "url": fmt.get("url", ""),
+                            "name": fmt.get("name", lang),
+                            "type": "manual"
                         })
 
-                # Get auto-generated subtitles
-                auto_subs = info.get('automatic_captions', {})
-                for lang_code, formats in auto_subs.items():
-                    # Only include if not already in manual subs
-                    if lang_code not in subtitles:
-                        url_to_use = None
-                        for fmt in formats:
-                            if fmt.get('ext') in ['srv3', 'srv2', 'srv1', 'ttml', 'vtt']:
-                                url_to_use = fmt.get('url')
-                                break
-                        if not url_to_use and formats:
-                            url_to_use = formats[0].get('url')
-
-                        if url_to_use:
+                for lang, formats in auto_captions.items():
+                    for fmt in formats:
+                        if fmt.get("ext") in ["vtt", "srv1", "srv2", "srv3", "json3"]:
                             tracks.append({
-                                'lang': lang_code,
-                                'langCode': lang_code,
-                                'baseUrl': url_to_use,
-                                'isAuto': True
+                                "lang": lang,
+                                "ext": fmt.get("ext", "vtt"),
+                                "url": fmt.get("url", ""),
+                                "name": fmt.get("name", lang),
+                                "type": "auto"
                             })
+                            break
 
-                self.wfile.write(json.dumps({
-                    'tracks': tracks,
-                    'title': title
-                }).encode())
+                self.respond(200, {
+                    "title": info.get("title", ""),
+                    "tracks": tracks
+                })
 
-        except Exception as e:
-            self.wfile.write(json.dumps({'error': str(e), 'tracks': []}).encode())
+            except subprocess.TimeoutExpired:
+                self.respond(500, {"error": "Request timed out"})
+            except Exception as e:
+                self.respond(500, {"error": str(e)})
+        else:
+            self.respond(404, {"error": "Not found"})
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    server = HTTPServer(('0.0.0.0', port), Handler)
-    print(f'Server running on port {port}')
+    def respond(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        print(f"{self.address_string()} - {format % args}")
+
+if __name__ == "__main__":
+    print(f"Server running on port {PORT}")
+    server = HTTPServer(("0.0.0.0", PORT), SubtitleHandler)
     server.serve_forever()
